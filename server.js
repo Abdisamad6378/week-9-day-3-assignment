@@ -4,10 +4,14 @@ const express = require('express');
 const cors = require('cors');
 const prisma = require('./db');
 const { validateConfig } = require('./config');
-const { initiateSTKPush, validateAmount } = require('./mpesa');
+const { initiateSTKPush, querySTKPushStatus, validateAmount } = require('./mpesa');
 const { formatPhoneNumber } = require('./phone');
 const {
+  RESOLVED_STATUSES,
+  statusFromResultCode,
+  updateIfPending,
   processCallback,
+  toPaymentResult,
 } = require('./payments');
 
 const app = express();
@@ -16,6 +20,7 @@ app.use(express.json());
 
 const MAX_ACCOUNT_REFERENCE = 12;
 const MAX_TRANSACTION_DESC = 13;
+const STILL_PROCESSING = 'Payment is still being processed. Try again in a few seconds.';
 
 const badRequest = (res, error) => res.status(400).json({ success: false, error });
 
@@ -26,6 +31,7 @@ app.get('/', (req, res) => {
       'GET  /api/health',
       'POST /api/mpesa/stkpush',
       'POST /api/mpesa/callback',
+      'POST /api/mpesa/query',
       'GET  /api/payments',
       'GET  /api/payments/:checkoutRequestId',
     ],
@@ -112,6 +118,54 @@ app.post('/api/mpesa/callback', (req, res) => {
   processCallback(req.body).catch((error) => {
     console.error(`Callback processing error: ${error.message}`);
   });
+});
+
+// Task 3: check a payment's status, from the database first, then from Daraja.
+app.post('/api/mpesa/query', async (req, res) => {
+  const { checkoutRequestId } = req.body || {};
+  if (!checkoutRequestId || typeof checkoutRequestId !== 'string') {
+    return badRequest(res, 'checkoutRequestId is required.');
+  }
+
+  const payment = await prisma.payment.findUnique({ where: { checkoutRequestId } });
+  if (!payment) {
+    return res.status(404).json({ success: false, error: 'Payment not found' });
+  }
+
+  // Already resolved (usually by the callback): no need to bother Daraja.
+  if (RESOLVED_STATUSES.includes(payment.status)) {
+    return res.json({ success: true, data: { ...toPaymentResult(payment), source: 'database' } });
+  }
+
+  let daraja;
+  try {
+    daraja = await querySTKPushStatus(checkoutRequestId);
+  } catch (error) {
+    // Daraja unreachable, timed out, rate limited, or "The transaction is being processed".
+    console.warn(`Query for ${checkoutRequestId} failed: ${error.message}`);
+    return res.json({
+      success: true,
+      data: { ...toPaymentResult(payment), status: 'pending', message: STILL_PROCESSING },
+    });
+  }
+
+  if (daraja.ResultCode === undefined || daraja.ResultCode === null) {
+    return res.json({
+      success: true,
+      data: { ...toPaymentResult(payment), status: 'pending', message: STILL_PROCESSING },
+    });
+  }
+
+  const resultCode = Number(daraja.ResultCode);
+  const status = statusFromResultCode(resultCode);
+
+  // Same rule as the callback: only change a pending payment. If the callback
+  // arrived while we were waiting for Daraja, keep what the callback saved.
+  await updateIfPending(checkoutRequestId, { status, resultCode, resultDesc: daraja.ResultDesc });
+  console.log(`Query: payment ${checkoutRequestId} is ${status}: ${daraja.ResultDesc}`);
+
+  const latest = await prisma.payment.findUnique({ where: { checkoutRequestId } });
+  res.json({ success: true, data: { ...toPaymentResult(latest), source: 'daraja' } });
 });
 
 app.get('/api/payments', async (req, res) => {

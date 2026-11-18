@@ -1,4 +1,5 @@
-// Daraja helpers: OAuth access token (with caching), timestamp, STK Push password and STK Push request.
+// Daraja helpers: OAuth access token (with caching), timestamp, STK Push password,
+// STK Push request and STK Push Query (status check).
 
 const axios = require('axios');
 const { validateConfig, getBaseUrl, getBase64Credentials } = require('./config');
@@ -190,8 +191,56 @@ async function initiateSTKPush(phoneNumber, amount, accountReference, transactio
   }
 }
 
+// Asks Daraja what happened to an STK Push.
+// Returns Daraja's reply, e.g. { ResponseCode: "0", ResultCode: "1032", ResultDesc: "Request cancelled by user" }.
+// Throws if Daraja cannot be reached or refuses the query. While the customer has not answered yet,
+// Daraja replies with HTTP 500 "The transaction is being processed", which also ends up as a throw.
+async function querySTKPushStatus(checkoutRequestId) {
+  if (!checkoutRequestId) {
+    throw validationError('checkoutRequestId is required.');
+  }
+
+  const config = validateConfig();
+  const token = await getAccessToken();
+  const timestamp = getTimestamp();
+
+  const payload = {
+    BusinessShortCode: config.shortcode,
+    Password: generatePassword(timestamp),
+    Timestamp: timestamp,
+    CheckoutRequestID: checkoutRequestId,
+  };
+
+  try {
+    const response = await axios.post(`${getBaseUrl()}/mpesa/stkpushquery/v1/query`, payload, {
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      timeout: 15000,
+    });
+    return response.data;
+  } catch (error) {
+    if (error.response) {
+      const { status, data } = error.response;
+      if (status === 401) clearTokenCache();
+      const detail =
+        (data && (data.errorMessage || data.fault?.faultstring || data.ResponseDescription)) ||
+        error.response.statusText;
+      const err = new Error(`STK Push query failed (HTTP ${status}): ${detail}`);
+      err.statusCode = 502;
+      err.darajaError = data;
+      throw err;
+    }
+    if (error.request) {
+      const err = new Error(`Could not reach Daraja at ${getBaseUrl()}: ${error.code || error.message}`);
+      err.statusCode = 503;
+      throw err;
+    }
+    throw error;
+  }
+}
+
 module.exports = {
   initiateSTKPush,
+  querySTKPushStatus,
   validateAmount,
   getAccessToken,
   isTokenCached,
